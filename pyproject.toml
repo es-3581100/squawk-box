@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "squawk-box"
-version = "0.1.0"
+version = "0.2.0"
 description = "Append-only build continuity ledger with deterministic replay and offline hyperlinked projections"
 readme = "README.md"
 requires-python = ">=3.11"
