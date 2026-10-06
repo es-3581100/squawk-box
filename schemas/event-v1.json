@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://es-3581100.github.io/squawk-box/schema/event-v1.json",
+  "title": "Squawk Box canonical event envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "eventId", "kind", "kindVersion", "recordedAt", "reportedBy", "submission", "subject", "context", "evidenceRefs", "authorityRefs", "relations", "payload"],
+  "properties": {
+    "schemaVersion": {"const": "donsquad-ledger/event-v1"},
+    "eventId": {"type": "string", "pattern": "^evt_[0-9a-f]{32}$"},
+    "kind": {"type": "string", "minLength": 1},
+    "kindVersion": {"type": "integer", "minimum": 1},
+    "recordedAt": {"type": "string", "format": "date-time"},
+    "occurredAt": {"type": "string", "format": "date-time"},
+    "reportedBy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "id", "boundBy"],
+      "properties": {
+        "type": {"enum": ["manager", "human", "donsquad", "agentRun", "tool"]},
+        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "boundBy": {"const": "channel"}
+      }
+    },
+    "submission": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "digest"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 160},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "subject": {"$ref": "#/$defs/ref"},
+    "context": {"type": "object"},
+    "evidenceRefs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "authorityRefs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "relations": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["rel", "target"],
+        "properties": {"rel": {"type": "string", "minLength": 1}, "target": {"$ref": "#/$defs/ref"}}
+      }
+    },
+    "payload": {"type": "object"}
+  },
+  "$defs": {
+    "ref": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": {"type": {"type": "string", "minLength": 1}, "id": {"type": "string", "minLength": 1}}
+    }
+  }
+}
