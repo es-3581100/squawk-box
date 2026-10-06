@@ -447,4 +447,197 @@ class LedgerStore:
             raise IntakeRejected(f"unknown submission fields: {sorted(unknown)}")
         kind = body.get("kind")
         version = body.get("kindVersion")
-        if not isinstance(kind, str)
+        if not isinstance(kind, str) or not kind:
+            raise IntakeRejected("kind is required")
+        if type(version) is not int or version < 1:
+            raise IntakeRejected("kindVersion must be a positive integer")
+        subject = body.get("subject")
+        if not isinstance(subject, dict) or set(subject) != {"type", "id"}:
+            raise IntakeRejected("subject must contain exactly type and id")
+        if not isinstance(subject["type"], str) or not isinstance(subject["id"], str) or not subject["id"]:
+            raise IntakeRejected("invalid subject")
+        if "occurredAt" in body:
+            try:
+                _parse_time(body["occurredAt"])
+            except Exception as exc:
+                raise IntakeRejected(f"invalid occurredAt: {exc}") from exc
+        for name in ("evidenceRefs", "authorityRefs"):
+            value = body.get(name, [])
+            if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+                raise IntakeRejected(f"{name} must be a string array")
+            if len(value) != len(set(value)):
+                raise IntakeRejected(f"{name} must not contain duplicates")
+        relations = body.get("relations", [])
+        if not isinstance(relations, list):
+            raise IntakeRejected("relations must be an array")
+        for rel in relations:
+            if not isinstance(rel, dict) or set(rel) != {"rel", "target"}:
+                raise IntakeRejected("relation must have rel and target")
+            if not isinstance(rel["rel"], str):
+                raise IntakeRejected("relation rel must be string")
+            target = rel["target"]
+            if not isinstance(target, dict) or set(target) != {"type", "id"}:
+                raise IntakeRejected("relation target must have type and id")
+        if not isinstance(body.get("context", {}), dict) or not isinstance(body.get("payload", {}), dict):
+            raise IntakeRejected("context and payload must be objects")
+        return deepcopy(body)
+
+    def _segment_paths(self) -> list[Path]:
+        if not self.events_dir.exists():
+            return []
+        return sorted(self.events_dir.glob("[0-9][0-9][0-9][0-9][0-9][0-9].jsonl"))
+
+    def _active_segment(self) -> Path:
+        paths = self._segment_paths()
+        if not paths:
+            path = self.events_dir / "000001.jsonl"
+            path.touch()
+            _fsync_dir(self.events_dir)
+            return path
+        return paths[-1]
+
+    def _append_event_line(self, line: bytes) -> Cursor:
+        if not line.endswith(b"\n"):
+            raise LedgerError("canonical event append must end with LF")
+        if len(line) > MAX_EVENT_BYTES:
+            raise LedgerError("EVENT_TOO_LARGE")
+        path = self._active_segment()
+        self._truncate_torn_tail(path)
+        event_count = sum(1 for raw in path.read_bytes().splitlines(keepends=True) if raw.endswith(b"\n"))
+        size = path.stat().st_size
+        if size + len(line) > SEGMENT_MAX_BYTES or event_count >= SEGMENT_MAX_EVENTS:
+            self._seal_segment(path)
+            next_num = int(path.stem) + 1
+            path = self.events_dir / f"{next_num:06d}.jsonl"
+            path.touch(exist_ok=False)
+            _fsync_dir(self.events_dir)
+            event_count = 0
+        with path.open("ab") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(self.events_dir)
+        return Cursor(int(path.stem), event_count + 1)
+
+    def _truncate_torn_tail(self, path: Path) -> None:
+        data = path.read_bytes()
+        if not data or data.endswith(b"\n"):
+            return
+        pos = data.rfind(b"\n")
+        keep = 0 if pos < 0 else pos + 1
+        with path.open("r+b") as f:
+            f.truncate(keep)
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(self.events_dir)
+
+    def _seal_segment(self, path: Path) -> None:
+        digest = _sha256_bytes(path.read_bytes())
+        seal = path.with_suffix(".sha256")
+        self._atomic_write_bytes(seal, (digest + "\n").encode("ascii"))
+
+    def _verify_closed_segments(self) -> None:
+        paths = self._segment_paths()
+        for path in paths[:-1]:
+            seal = path.with_suffix(".sha256")
+            if not seal.is_file():
+                raise ReplayBlocked(f"closed segment missing seal: {path.name}")
+            expected = seal.read_text(encoding="ascii").strip()
+            actual = _sha256_bytes(path.read_bytes())
+            if expected != actual:
+                raise ReplayBlocked(f"closed segment digest mismatch: {path.name}")
+
+    def _read_events_for_replay(self) -> tuple[list[dict[str, Any] | None], list[Cursor], list[dict[str, Any]]]:
+        self._verify_closed_segments()
+        events: list[dict[str, Any] | None] = []
+        cursors: list[Cursor] = []
+        warnings: list[dict[str, Any]] = []
+        paths = self._segment_paths()
+        for p_index, path in enumerate(paths):
+            segment = int(path.stem)
+            raw_data = path.read_bytes()
+            lines = raw_data.splitlines(keepends=True)
+            for idx, raw in enumerate(lines, 1):
+                cursor = Cursor(segment, idx)
+                if not raw.endswith(b"\n"):
+                    if p_index == len(paths) - 1 and idx == len(lines):
+                        warnings.append({"type": "TORN_TAIL_IGNORED", "cursor": cursor.to_dict()})
+                        continue
+                    raise ReplayBlocked(f"unterminated record before active tail at {cursor.label()}")
+                try:
+                    decoded = raw.decode("utf-8")
+                    event = _safe_json_loads(decoded)
+                    if not isinstance(event, dict):
+                        raise ValueError("event must be object")
+                except Exception:
+                    event = None
+                events.append(event)
+                cursors.append(cursor)
+        return events, cursors, warnings
+
+    def _load_repairs(self) -> list[dict[str, Any]]:
+        repairs: list[dict[str, Any]] = []
+        if not self.repairs_path.exists():
+            return repairs
+        for idx, raw in enumerate(self.repairs_path.read_bytes().splitlines(keepends=True), 1):
+            if not raw.endswith(b"\n"):
+                raise ReplayBlocked(f"torn repair overlay at line {idx}")
+            try:
+                record = _safe_json_loads(raw.decode("utf-8"))
+            except Exception as exc:
+                raise ReplayBlocked(f"malformed repair overlay at line {idx}: {exc}") from exc
+            if not isinstance(record, dict) or record.get("schemaVersion") != REPAIR_SCHEMA:
+                raise ReplayBlocked(f"unauthorized/invalid repair overlay record at line {idx}")
+            if record.get("authorizedBy", {}).get("type") != "human" or not record.get("authorizedBy", {}).get("ref"):
+                raise ReplayBlocked(f"repair overlay lacks human authorization at line {idx}")
+            repairs.append(record)
+        return repairs
+
+    def _atomic_write_json(self, path: Path, value: Any) -> None:
+        self._atomic_write_bytes(path, (canonical_json(value) + "\n").encode("utf-8"))
+
+    def _atomic_write_bytes(self, path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("xb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+
+
+class Reducer:
+    def __init__(self, *, as_of: str):
+        self.as_of = as_of
+        self.as_of_dt = _parse_time(as_of)
+        self.tasks: dict[str, Any] = {}
+        self.attempts: dict[str, Any] = {}
+        self.agent_runs: dict[str, Any] = {}
+        self.contexts: dict[str, Any] = {}
+        self.handoffs: list[Any] = []
+        self.decisions: dict[str, Any] = {}
+        self.claims: dict[str, Any] = {}
+        self.evidence: dict[str, Any] = {}
+        self.artifacts: dict[str, Any] = {}
+        self.artifact_versions: dict[str, Any] = {}
+        self.artifact_presence: dict[str, Any] = {}
+        self.failures: dict[str, Any] = {}
+        self.authorities: dict[str, Any] = {}
+        self.checkpoints: dict[str, Any] = {}
+        self.payload_purges: list[Any] = []
+        self.completion_proposals: list[Any] = []
+        self.corrections: list[Any] = []
+        self.edges: list[dict[str, Any]] = []
+        self.incoming: dict[str, list[dict[str, Any]]] = {}
+        self.outgoing: dict[str, list[dict[str, Any]]] = {}
+        self.anomalies: list[dict[str, Any]] = []
+        self.warnings: list[dict[str, Any]] = []
+        self.indeterminate_subjects: dict[str, str] = {}
+
+    def semantic_anomaly(self, event: dict[str, Any], cursor: Cursor, reason: str) -> None:
+        subject = event.get("subject", {})
+        subject_id = subject.get("id") if isinstance(subject, dict) else None
+        self.anomalies.append({
+            "type": "SEMANTIC_ANOMALY",
+            "cu
