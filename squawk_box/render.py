@@ -386,7 +386,7 @@ function link(id,label){const a=el('a','',label||id);a.href='#e-'+encodeURICompo
 function clear(){const m=$('#content');m.replaceChildren();return m}
 function present(v){return !(v===undefined||v===null||v===''||(Array.isArray(v)&&v.length===0))}
 function valueText(v){if(Array.isArray(v))return v.join(', ');if(typeof v==='boolean')return v?'YES':'NO';if(typeof v==='object')return JSON.stringify(v);return String(v)}
-function fieldList(entries){const dl=el('dl','fields');for(const entry of entries){if(!present(entry.value))continue;const dt=el('dt','',entry.label);const dd=el('dd');if(entry.ref){dd.append(link(entry.ref,entry.display||valueText(entry.value)))}else{dd.append(document.createTextNode(valueText(entry.value)))}if(entry.provenance)dd.append(el('small','provenance','['+entry.provenance+']'));dl.append(dt,dd)}return dl}
+function fieldList(entries){const dl=el('dl','fields');for(const entry of entries){if(!present(entry.value))continue;const dt=el('dt','',entry.label+': ');const dd=el('dd');if(entry.ref){dd.append(link(entry.ref,entry.display||valueText(entry.value)))}else{dd.append(document.createTextNode(valueText(entry.value)))}if(entry.provenance)dd.append(el('small','provenance',' ['+entry.provenance+']'));dl.append(dt,dd)}return dl}
 function typedFields(group,o){
   if(group==='tasks')return [
     {label:'Status',value:o.status},{label:'Objective',value:o.objective},{label:'Owner role',value:o.ownerRole},
