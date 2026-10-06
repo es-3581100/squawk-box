@@ -640,4 +640,184 @@ class Reducer:
         subject_id = subject.get("id") if isinstance(subject, dict) else None
         self.anomalies.append({
             "type": "SEMANTIC_ANOMALY",
-            "cu
+            "cursor": cursor.to_dict(),
+            "eventId": event.get("eventId"),
+            "subjectId": subject_id,
+            "reason": reason,
+        })
+        if isinstance(subject_id, str):
+            self.indeterminate_subjects[subject_id] = reason
+
+    def apply(self, event: dict[str, Any], cursor: Cursor) -> None:
+        try:
+            self._apply(event, cursor)
+        except (KeyError, TypeError, ValueError, AssertionError) as exc:
+            self.semantic_anomaly(event, cursor, str(exc))
+
+    def _apply(self, event: dict[str, Any], cursor: Cursor) -> None:
+        kind = event["kind"]
+        subject = event["subject"]
+        sid = subject["id"]
+        payload = event.get("payload", {})
+        base = {
+            "id": sid,
+            "lastEventId": event["eventId"],
+            "lastCursor": cursor.to_dict(),
+        }
+
+        if kind == "task.created":
+            assert subject["type"] == "task" and validate_id(sid, "task"), "invalid task subject"
+            assert sid not in self.tasks, "task already exists"
+            external_key = payload["externalKey"]
+            assert isinstance(external_key, str) and external_key, "externalKey required"
+            if any(t.get("externalKey") == external_key for t in self.tasks.values()):
+                raise ValueError("duplicate task externalKey")
+            status = payload.get("status", "PLANNED")
+            assert status in TASK_TRANSITIONS, "invalid initial task status"
+            self.tasks[sid] = {
+                **base,
+                "externalKey": external_key,
+                "title": payload.get("title", external_key),
+                "objective": payload.get("objective", ""),
+                "parentTask": payload.get("parentTask"),
+                "ownerRole": payload.get("ownerRole"),
+                "status": status,
+                "constraints": payload.get("constraints", []),
+                "scope": payload.get("scope", []),
+                "attemptIds": [],
+                "childTaskIds": [],
+                "blockers": [],
+            }
+            parent = payload.get("parentTask")
+            if parent:
+                assert parent in self.tasks, "parent task not found"
+                self.tasks[parent]["childTaskIds"].append(sid)
+
+        elif kind == "task.status_changed":
+            assert sid in self.tasks and subject["type"] == "task", "task not found"
+            old = self.tasks[sid]["status"]
+            new = payload["status"]
+            assert new in TASK_TRANSITIONS.get(old, set()), f"illegal task transition {old}->{new}"
+            self.tasks[sid]["status"] = new
+            self.tasks[sid].update({"lastEventId": event["eventId"], "lastCursor": cursor.to_dict()})
+            if "blockers" in payload:
+                self.tasks[sid]["blockers"] = payload["blockers"]
+
+        elif kind == "task.completion_proposed":
+            assert subject["type"] == "task", "completion proposal must target task"
+            self.completion_proposals.append({**base, "taskId": sid, "reportedBy": event["reportedBy"], "payload": deepcopy(payload)})
+
+        elif kind == "agent_run.started":
+            assert subject["type"] == "agentRun" and validate_id(sid, "agentRun"), "invalid agentRun subject"
+            assert sid not in self.agent_runs, "agent run exists"
+            self.agent_runs[sid] = {**base, **deepcopy(payload), "status": "ACTIVE", "startedAt": event.get("occurredAt", event["recordedAt"])}
+
+        elif kind == "agent_run.completed":
+            assert sid in self.agent_runs, "agent run not found"
+            self.agent_runs[sid].update({"status": "COMPLETE", "endedAt": event.get("occurredAt", event["recordedAt"]), "lastEventId": event["eventId"]})
+
+        elif kind == "attempt.started":
+            assert subject["type"] == "attempt" and validate_id(sid, "attempt"), "invalid attempt subject"
+            assert sid not in self.attempts, "attempt exists"
+            task_id = payload["taskId"]
+            assert task_id in self.tasks, "task not found"
+            self.attempts[sid] = {
+                **base,
+                **deepcopy(payload),
+                "status": "STARTED",
+                "startedAt": event.get("occurredAt", event["recordedAt"]),
+            }
+            self.tasks[task_id]["attemptIds"].append(sid)
+
+        elif kind == "attempt.completed":
+            assert sid in self.attempts, "attempt not found"
+            assert self.attempts[sid]["status"] == "STARTED", "attempt already terminal"
+            outcome = payload["outcome"]
+            assert outcome in ATTEMPT_OUTCOMES, "invalid attempt outcome"
+            self.attempts[sid].update({
+                "status": outcome,
+                "endedAt": event.get("occurredAt", event["recordedAt"]),
+                "result": deepcopy(payload.get("result", {})),
+                "lastEventId": event["eventId"],
+                "lastCursor": cursor.to_dict(),
+            })
+
+        elif kind == "context.supplied":
+            assert subject["type"] == "suppliedContext" and validate_id(sid, "context"), "invalid supplied context"
+            self.contexts[sid] = {**base, **deepcopy(payload)}
+
+        elif kind == "handoff.recorded":
+            self.handoffs.append({**base, "subject": deepcopy(subject), "payload": deepcopy(payload), "reportedBy": event["reportedBy"]})
+
+        elif kind == "decision.proposed":
+            assert subject["type"] == "decision" and validate_id(sid, "decision"), "invalid decision subject"
+            assert sid not in self.decisions, "decision exists"
+            self.decisions[sid] = {
+                **base,
+                **deepcopy(payload),
+                "status": "PROPOSED",
+                "proposedBy": deepcopy(event["reportedBy"]),
+                "supportingEvidenceChanged": False,
+            }
+
+        elif kind == "decision.resolved":
+            assert sid in self.decisions, "decision not found"
+            status = payload["status"]
+            assert status in DECISION_STATES - {"PROPOSED"}, "invalid decision resolution"
+            current = self.decisions[sid]["status"]
+            assert current in {"PROPOSED", "ACCEPTED", "EXPERIMENTAL"}, "decision cannot transition from current state"
+            self.decisions[sid].update({"status": status, "resolution": deepcopy(payload), "lastEventId": event["eventId"]})
+
+        elif kind == "claim.asserted":
+            assert subject["type"] == "claim" and validate_id(sid, "claim"), "invalid claim subject"
+            assert sid not in self.claims, "claim exists"
+            self.claims[sid] = {
+                **base,
+                "statement": payload["statement"],
+                "supportState": "UNVERIFIED",
+                "freshness": "CURRENT",
+                "evidenceBindings": deepcopy(payload.get("evidenceBindings", [])),
+                "supportsClaims": deepcopy(payload.get("supportsClaims", [])),
+                "origin": deepcopy(event["reportedBy"]),
+                "lastValidation": None,
+            }
+
+        elif kind == "claim.assessed":
+            assert sid in self.claims, "claim not found"
+            state = payload["supportState"]
+            assert state in CLAIM_SUPPORT_STATES, "invalid claim support state"
+            freshness = payload.get("freshness", "CURRENT")
+            assert freshness in CLAIM_FRESHNESS, "invalid claim freshness"
+            self.claims[sid].update({
+                "supportState": state,
+                "freshness": freshness,
+                "lastValidation": event.get("occurredAt", event["recordedAt"]),
+                "assessment": deepcopy(payload),
+                "lastEventId": event["eventId"],
+            })
+
+        elif kind == "claim.retracted":
+            assert sid in self.claims, "claim not found"
+            self.claims[sid].update({"supportState": "RETRACTED", "lastEventId": event["eventId"]})
+
+        elif kind == "evidence.recorded":
+            assert subject["type"] == "evidenceBundle" and validate_id(sid, "evidenceBundle"), "invalid evidence subject"
+            assert sid not in self.evidence, "evidence bundle exists"
+            self.evidence[sid] = {**base, **deepcopy(payload), "reportedBy": deepcopy(event["reportedBy"])}
+
+        elif kind == "artifact.registered":
+            assert subject["type"] == "artifact" and validate_id(sid, "artifact"), "invalid artifact subject"
+            assert sid not in self.artifacts, "artifact exists"
+            self.artifacts[sid] = {
+                **base,
+                "logicalName": payload["logicalName"],
+                "artifactType": payload.get("artifactType", "file"),
+                "currentPath": payload.get("path"),
+                "lifecycleState": "ACTIVE",
+                "currentVersionId": None,
+                "versionIds": [],
+            }
+
+        elif kind == "artifact.version_observed":
+            assert subject["type"] == "artifactVersion" and validate_id(sid, "artifactVersion"), "invalid artifactVersion subject"
+  
