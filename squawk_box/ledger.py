@@ -247,4 +247,204 @@ class LedgerStore:
             "kind": normalized["kind"],
             "kindVersion": normalized["kindVersion"],
             "recordedAt": now_iso(),
-            "r
+            "reportedBy": {"type": reporter_type, "id": reporter_id, "boundBy": "channel"},
+            "submission": {"id": submission_id, "digest": request_digest},
+            "subject": normalized["subject"],
+            "context": normalized.get("context", {}),
+            "evidenceRefs": normalized.get("evidenceRefs", []),
+            "authorityRefs": normalized.get("authorityRefs", []),
+            "relations": normalized.get("relations", []),
+            "payload": normalized.get("payload", {}),
+        }
+        if "occurredAt" in normalized:
+            event["occurredAt"] = normalized["occurredAt"]
+        line = canonical_line(event)
+        if len(line) > MAX_EVENT_BYTES:
+            raise IntakeRejected("EVENT_TOO_LARGE")
+        pending = self.pending_dir / f"{event['eventId']}.json"
+        self._atomic_write_bytes(pending, line)
+        self._append_event_line(line)
+        pending.unlink()
+        _fsync_dir(self.pending_dir)
+        return event
+
+    def record_repair(
+        self,
+        *,
+        action: str,
+        cursor: Cursor | None,
+        event_id: str | None,
+        reason: str,
+        authorized_by: str,
+        target_repair_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_initialized()
+        with self.writer_lock():
+            return self._record_repair_locked(
+                action=action, cursor=cursor, event_id=event_id, reason=reason,
+                authorized_by=authorized_by, target_repair_id=target_repair_id,
+            )
+
+    def _record_repair_locked(
+        self,
+        *,
+        action: str,
+        cursor: Cursor | None,
+        event_id: str | None,
+        reason: str,
+        authorized_by: str,
+        target_repair_id: str | None = None,
+    ) -> dict[str, Any]:
+        if action not in {"QUARANTINE", "REVOKE_QUARANTINE"}:
+            raise LedgerError("unsupported repair action")
+        if action == "QUARANTINE" and cursor is None and event_id is None:
+            raise LedgerError("quarantine requires cursor or eventId")
+        if action == "REVOKE_QUARANTINE" and not target_repair_id:
+            raise LedgerError("revoke requires targetRepairId")
+        repair = {
+            "schemaVersion": REPAIR_SCHEMA,
+            "repairId": new_id("repair"),
+            "action": action,
+            "reason": reason,
+            "authorizedBy": {"type": "human", "ref": authorized_by},
+            "authorizedAt": now_iso(),
+        }
+        if cursor is not None:
+            repair["cursor"] = cursor.to_dict()
+        if event_id is not None:
+            repair["eventId"] = event_id
+        if target_repair_id:
+            repair["targetRepairId"] = target_repair_id
+        line = canonical_line(repair)
+        with self.repairs_path.open("ab") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(self.root)
+        return repair
+
+    def replay(self, *, as_of: str | None = None) -> dict[str, Any]:
+        self.require_initialized()
+        self.recover_pending()
+        reducer = Reducer(as_of=as_of or now_iso())
+        events, cursors, warnings = self._read_events_for_replay()
+        reducer.warnings.extend(warnings)
+        repairs = self._load_repairs()
+        effective_quarantines = _effective_quarantines(repairs)
+
+        # Corrections are valid events, not repair records. Precompute their final replacement.
+        correction_map: dict[str, dict[str, Any]] = {}
+        for event in events:
+            if event is None or event.get("kind") != "event.correction_recorded":
+                continue
+            payload = event.get("payload", {})
+            target = payload.get("targetEventId")
+            replacement = payload.get("replacement")
+            if isinstance(target, str) and isinstance(replacement, dict):
+                correction_map[target] = replacement
+
+        seen_ids: set[str] = set()
+        last_cursor: Cursor | None = None
+        for event, cursor in zip(events, cursors):
+            last_cursor = cursor
+            q = _is_quarantined(event, cursor, effective_quarantines)
+            if q:
+                reducer.anomalies.append({"type": "QUARANTINED", "cursor": cursor.to_dict(), "eventId": event.get("eventId") if event else None})
+                continue
+            if event is None:
+                raise ReplayBlocked(f"corrupt complete event at {cursor.label()} without authorized quarantine")
+            event_id = event.get("eventId")
+            if not isinstance(event_id, str):
+                raise ReplayBlocked(f"event without eventId at {cursor.label()}")
+            if event_id in seen_ids:
+                raise ReplayBlocked(f"duplicate eventId {event_id} at {cursor.label()}")
+            seen_ids.add(event_id)
+            if event.get("schemaVersion") != EVENT_SCHEMA:
+                raise ReplayBlocked(f"unsupported event schema at {cursor.label()}")
+            if (event.get("kind"), event.get("kindVersion")) not in KIND_REPORTERS:
+                reducer.semantic_anomaly(event, cursor, "unknown event kind/version")
+                continue
+            effective = event
+            if event_id in correction_map and event.get("kind") != "event.correction_recorded":
+                effective = _apply_correction(event, correction_map[event_id])
+            reducer.apply(effective, cursor)
+
+        state = reducer.finalize(last_cursor)
+        state["repairs"] = {"count": len(repairs), "activeQuarantines": len(effective_quarantines)}
+        return state
+
+    def find_submission(self, reporter_type: str, reporter_id: str, submission_id: str) -> dict[str, Any] | None:
+        for event, _cursor in self.iter_parseable_events(include_corrupt=False):
+            if event.get("reportedBy", {}).get("type") != reporter_type:
+                continue
+            if event.get("reportedBy", {}).get("id") != reporter_id:
+                continue
+            if event.get("submission", {}).get("id") == submission_id:
+                return event
+        return None
+
+    def recover_pending(self) -> list[str]:
+        if not self.pending_dir.exists():
+            return []
+        recovered: list[str] = []
+        known = {event.get("eventId") for event, _ in self.iter_parseable_events(include_corrupt=False)}
+        for pending in sorted(self.pending_dir.glob("evt_*.json")):
+            data = pending.read_bytes()
+            try:
+                event = _safe_json_loads(data.decode("utf-8"))
+            except Exception as exc:
+                raise ReplayBlocked(f"malformed pending event {pending}: {exc}") from exc
+            event_id = event.get("eventId")
+            if event_id not in known:
+                if not data.endswith(b"\n"):
+                    data += b"\n"
+                self._append_event_line(data)
+                known.add(event_id)
+                recovered.append(event_id)
+            pending.unlink()
+            _fsync_dir(self.pending_dir)
+        return recovered
+
+    def iter_parseable_events(self, *, include_corrupt: bool = False) -> Iterable[tuple[dict[str, Any], Cursor]]:
+        for path in self._segment_paths():
+            segment = int(path.stem)
+            data = path.read_bytes()
+            lines = data.splitlines(keepends=True)
+            for idx, raw in enumerate(lines, 1):
+                if not raw.endswith(b"\n"):
+                    continue
+                try:
+                    event = _safe_json_loads(raw.decode("utf-8"))
+                except Exception:
+                    if include_corrupt:
+                        continue
+                    continue
+                if isinstance(event, dict):
+                    yield event, Cursor(segment, idx)
+
+    @contextmanager
+    def writer_lock(self):
+        """Serialize cooperative local writers. Not a same-UID security boundary."""
+        if fcntl is None:
+            raise LedgerError("v0 writer lock requires POSIX fcntl")
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _validate_submission_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise IntakeRejected("submission body must be an object")
+        forbidden = {"eventId", "recordedAt", "reportedBy", "submission", "schemaVersion"}
+        if forbidden & set(body):
+            raise IntakeRejected(f"manager-owned fields supplied: {sorted(forbidden & set(body))}")
+        allowed = {"kind", "kindVersion", "occurredAt", "subject", "context", "evidenceRefs", "authorityRefs", "relations", "payload"}
+        unknown = set(body) - allowed
+        if unknown:
+            raise IntakeRejected(f"unknown submission fields: {sorted(unknown)}")
+        kind = body.get("kind")
+        version = body.get("kindVersion")
+        if not isinstance(kind, str)
