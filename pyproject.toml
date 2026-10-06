@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "squawk-box"
+version = "0.1.0"
+description = "Append-only build continuity ledger with deterministic replay and offline hyperlinked projections"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "BSD-2-Clause"}
+authors = [{name = "es-3581100"}]
+dependencies = []
+
+[project.scripts]
+squawk-box = "squawk_box.cli:main"
+
+[tool.setuptools]
+packages = ["squawk_box"]
