@@ -11,9 +11,10 @@ Implemented and locally verified:
 - basic graph/backreferences and staleness;
 - compact Markdown projections;
 - self-contained offline HTML map;
-- 16 unit tests passing under Python stdlib only.
+- 16 unit tests passing under Python stdlib only;
+- direct example execution from an uninstalled fresh source checkout.
 
-Remote CI gate: `.github/workflows/ci.yml` exercises Python 3.11, 3.12, and 3.13, the adversarial unit suite, the Retry2→Retry3 demo replay/render, `compileall`, and strict JSON parsing of the schema files.
+Remote CI exercises Python 3.11, 3.12, 3.13, and 3.14. For every version it runs the Retry2→Retry3 demo before installation, installs the package, runs the adversarial unit suite, reruns the demo, runs `compileall`, and strictly parses the JSON schema files.
 
 Current trust deployment in local CLI use is normally `cooperative_same_uid`. Strong OS-separated manager/socket identity is the next security-hardening slice.
 

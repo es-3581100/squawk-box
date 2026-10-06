@@ -1,6 +1,14 @@
 """Build a small ledger demonstrating semantic continuity across a transport-only retry."""
 from pathlib import Path
 import shutil
+import sys
+
+# Make the example runnable directly from a fresh source checkout, before the
+# package has been installed. Python otherwise places examples/ (not the repo
+# root) on sys.path when executing this file by path.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from squawk_box.ledger import LedgerStore
 from squawk_box.model import new_id
