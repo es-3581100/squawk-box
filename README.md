@@ -10,7 +10,7 @@ The canonical store is JSONL history plus detached content-addressed payloads an
 
 Squawk Box does **not** turn `PASS`, `APPROVED`, a hash match, a remembered claim, or a ledger status into authority. It records what was observed and derives navigable state; authority remains external.
 
-## Current v0.2 slice
+## Current v0.2.1 slice
 
 Implemented now:
 
@@ -35,7 +35,7 @@ Implemented now:
 - type-aware task/attempt/failure/artifact projections that omit irrelevant fields;
 - first-class Attempts navigation and entity pages;
 - derived Build Story projections in JSON, Markdown, and HTML with provenance labels;
-- semantic `<dl><dt><dd>` field rendering for more reliable generic HTML→text extraction;
+- semantic `<dl><dt><dd>` field rendering with literal `Label: value` text boundaries for generic HTML→text extraction;
 - no remote CSS, JavaScript, fonts, or data dependencies;
 - BSD-2-Clause license.
 
@@ -85,6 +85,15 @@ Open:
 ```text
 .ledger/generated/ledger.html
 ```
+
+For local browser fragments, use a real `file://` URI so `#...` is treated as a URL fragment rather than part of the filename:
+
+```bash
+LEDGER="$(realpath .ledger/generated/ledger.html)"
+nohup xdg-open "file://$LEDGER#Build%20Story" >/dev/null 2>&1 &
+```
+
+Other useful fragments include `#Attempts`, `#Failures`, `#Artifacts`, and `#Timeline`.
 
 The URL fragment for an entity is stable:
 
@@ -188,7 +197,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/EVENT_V1_FREEZE.md](d
 python -m unittest discover -s tests -v
 ```
 
-The v0.2 suite covers intake ownership, idempotency conflict, capability rejection, retry/history semantics, staleness, time-dependent authority, corruption/repair, torn tails, payload purge, HTML data escaping, deterministic replay, and the Retry2→Retry3 type-aware Build Story projection.
+The v0.2.1 suite covers intake ownership, idempotency conflict, capability rejection, retry/history semantics, staleness, time-dependent authority, corruption/repair, torn tails, payload purge, HTML data escaping, deterministic replay, the Retry2→Retry3 type-aware Build Story projection, and literal extractor-safe field separators.
 
 ## License
 

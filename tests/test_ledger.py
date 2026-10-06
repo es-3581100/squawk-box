@@ -365,6 +365,8 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("Build Story", page)
         self.assertIn("Attempts", page)
         self.assertIn("const dl=el('dl','fields')", page)
+        self.assertIn("entry.label+': '", page)
+        self.assertIn("' ['+entry.provenance+']'", page)
         self.assertIn("Failure domain", page)
         self.assertIn("Created by attempt", page)
         self.assertNotIn("['status','supportState','freshness','currentState'", page)
