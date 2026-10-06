@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "verify/v0.1"]
   pull_request:
   workflow_dispatch:
 
@@ -29,7 +29,9 @@ jobs:
       - name: Compile all Python
         run: python -m compileall -q squawk_box tests examples
       - name: Validate JSON schema files
-        run: python - <<'PY'
+        shell: bash
+        run: |
+          python - <<'PY'
           import json
           from pathlib import Path
           for p in sorted(Path("schemas").glob("*.json")):
