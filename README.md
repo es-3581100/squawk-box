@@ -10,7 +10,7 @@ The canonical store is JSONL history plus detached content-addressed payloads an
 
 Squawk Box does **not** turn `PASS`, `APPROVED`, a hash match, a remembered claim, or a ledger status into authority. It records what was observed and derives navigable state; authority remains external.
 
-## Current v0.1 slice
+## Current v0.2 slice
 
 Implemented now:
 
@@ -32,6 +32,10 @@ Implemented now:
 - canonical directed relations with generated incoming/outgoing indexes;
 - compact Markdown build briefs;
 - self-contained offline `ledger.html` with stable entity anchors, search, timeline, and backreferences;
+- type-aware task/attempt/failure/artifact projections that omit irrelevant fields;
+- first-class Attempts navigation and entity pages;
+- derived Build Story projections in JSON, Markdown, and HTML with provenance labels;
+- semantic `<dl><dt><dd>` field rendering for more reliable generic HTML→text extraction;
 - no remote CSS, JavaScript, fonts, or data dependencies;
 - BSD-2-Clause license.
 
@@ -105,6 +109,7 @@ ledger.html#e-tsk_<opaque-id>
     ├── current-state.json
     ├── graph-index.json
     ├── search-index.json
+    ├── build-stories.json
     ├── briefs/
     └── ledger.html
 ```
@@ -183,7 +188,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/EVENT_V1_FREEZE.md](d
 python -m unittest discover -s tests -v
 ```
 
-The v0 suite covers intake ownership, idempotency conflict, capability rejection, retry/history semantics, staleness, time-dependent authority, corruption/repair, torn tails, payload purge, HTML data escaping, and deterministic replay.
+The v0.2 suite covers intake ownership, idempotency conflict, capability rejection, retry/history semantics, staleness, time-dependent authority, corruption/repair, torn tails, payload purge, HTML data escaping, deterministic replay, and the Retry2→Retry3 type-aware Build Story projection.
 
 ## License
 

@@ -8,7 +8,7 @@ import unittest
 from squawk_box.errors import IntakeRejected, ReplayBlocked
 from squawk_box.ledger import LedgerStore
 from squawk_box.model import Cursor, new_id
-from squawk_box.render import write_projections
+from squawk_box.render import build_story_index, write_projections
 
 
 AS_OF = "2026-10-06T12:00:00Z"
@@ -252,6 +252,122 @@ class LedgerTests(unittest.TestCase):
                 },
             )
         self.assertEqual(list(self.store.iter_parseable_events(include_corrupt=False)), [])
+
+    def test_type_aware_build_story_projection(self):
+        task = self.create_task("chunk-08.1e")
+        attempt2 = new_id("attempt")
+        attempt3 = new_id("attempt")
+        failure = new_id("failure")
+        artifact = new_id("artifact")
+        version = new_id("artifactVersion")
+        digest = "ecfd2f2a8c49bec6283de60fbc747e606d815c150c546f9d9907e4a9c74fdd97"
+
+        self.submit({"kind":"task.status_changed","kindVersion":1,"subject":{"type":"task","id":task},"payload":{"status":"READY"}}, reporter_type="human", reporter_id="user")
+        self.submit({"kind":"task.status_changed","kindVersion":1,"subject":{"type":"task","id":task},"payload":{"status":"ACTIVE"}}, reporter_type="human", reporter_id="user")
+        self.submit({
+            "kind":"attempt.started","kindVersion":1,
+            "subject":{"type":"attempt","id":attempt2},
+            "payload":{"taskId":task,"ordinal":2,"changedDimensions":[]},
+        })
+        self.submit({
+            "kind":"failure.recorded","kindVersion":1,
+            "subject":{"type":"failure","id":failure},
+            "payload":{
+                "taskId":task,"attemptId":attempt2,"failureDomain":"TRANSPORT",
+                "symptom":"72,492-byte schema exceeded 50KB emission guard",
+                "rootCauseState":"KNOWN","rootCause":"artificial 50KB transport guard",
+                "survivedRefs":["118-definition-tree","sha256:ecfd2f2a"],"status":"OPEN",
+            },
+        })
+        self.submit({
+            "kind":"attempt.completed","kindVersion":1,
+            "subject":{"type":"attempt","id":attempt2},
+            "payload":{"outcome":"FAILED_RETRYABLE","result":{"semanticCompilation":"COMPLETE","materialization":"INCOMPLETE"}},
+        })
+        self.submit({"kind":"task.status_changed","kindVersion":1,"subject":{"type":"task","id":task},"payload":{"status":"NEEDS_RETRY"}}, reporter_type="human", reporter_id="user")
+        self.submit({"kind":"task.status_changed","kindVersion":1,"subject":{"type":"task","id":task},"payload":{"status":"ACTIVE"}}, reporter_type="human", reporter_id="user")
+        self.submit({
+            "kind":"attempt.started","kindVersion":1,
+            "subject":{"type":"attempt","id":attempt3},
+            "relations":[{"rel":"retries","target":{"type":"attempt","id":attempt2}}],
+            "payload":{
+                "taskId":task,"ordinal":3,"retryOf":attempt2,"changedDimensions":["TRANSPORT"],
+                "continuity":{
+                    "derived":{"sameTask":True,"sameAgentRun":True,"sameSession":True,"sameInputs":True,"sameDesignRefs":True},
+                    "asserted":{"sameSemanticDesign":{"value":True,"assertedBy":"run_demo","basisRefs":["frozen-design"]}},
+                },
+            },
+        })
+        self.submit({
+            "kind":"artifact.registered","kindVersion":1,
+            "subject":{"type":"artifact","id":artifact},
+            "payload":{
+                "logicalName":"operational schema","artifactType":"json-schema",
+                "path":"docs/governance/startup-verification.schema.operational.v1.2.json",
+            },
+        })
+        self.submit({
+            "kind":"artifact.version_observed","kindVersion":1,
+            "subject":{"type":"artifactVersion","id":version},
+            "relations":[{"rel":"produced_by","target":{"type":"attempt","id":attempt3}}],
+            "payload":{
+                "artifactId":artifact,
+                "pathAtObservation":"docs/governance/startup-verification.schema.operational.v1.2.json",
+                "size":72492,
+                "byteDigest":{"digestType":"artifact_bytes","algorithm":"sha256","value":digest},
+                "persistenceClass":"DURABLE","createdByAttempt":attempt3,
+            },
+        })
+        self.submit({
+            "kind":"failure.status_changed","kindVersion":1,
+            "subject":{"type":"failure","id":failure},
+            "payload":{"status":"RESOLVED","resolution":"bounded chunk transport"},
+        })
+        self.submit({
+            "kind":"attempt.completed","kindVersion":1,
+            "subject":{"type":"attempt","id":attempt3},
+            "payload":{"outcome":"SUCCEEDED","result":{"semanticCompilation":"UNCHANGED","materialization":"COMPLETE"}},
+        })
+        self.submit({"kind":"task.status_changed","kindVersion":1,"subject":{"type":"task","id":task},"payload":{"status":"COMPLETE"}}, reporter_type="human", reporter_id="user")
+
+        state = self.store.replay(as_of=AS_OF)
+        stories = build_story_index(state)
+        self.assertEqual(len(stories), 1)
+        story = stories[0]
+        self.assertEqual(story["externalKey"], "chunk-08.1e")
+        self.assertEqual(story["status"], "COMPLETE")
+        steps = {step["entityId"]: step for step in story["steps"] if step.get("entityId")}
+        attempt2_facts = {fact["label"]: fact for fact in steps[attempt2]["facts"]}
+        attempt3_facts = {fact["label"]: fact for fact in steps[attempt3]["facts"]}
+        failure_facts = {fact["label"]: fact for fact in steps[failure]["facts"]}
+        version_facts = {fact["label"]: fact for fact in steps[version]["facts"]}
+
+        self.assertEqual(attempt2_facts["Semantic compilation"]["value"], "COMPLETE")
+        self.assertEqual(attempt2_facts["Materialization"]["value"], "INCOMPLETE")
+        self.assertEqual(attempt3_facts["Changed dimensions"]["value"], "TRANSPORT")
+        self.assertIs(attempt3_facts["Continuity · sameSemanticDesign"]["value"], True)
+        self.assertIn("asserted by run_demo", attempt3_facts["Continuity · sameSemanticDesign"]["provenance"])
+        self.assertEqual(failure_facts["Status"]["value"], "RESOLVED")
+        self.assertEqual(failure_facts["Resolution"]["value"], "bounded chunk transport")
+        self.assertEqual(version_facts["Size"]["value"], "72,492 bytes")
+        self.assertEqual(version_facts["SHA-256"]["value"], digest)
+
+        paths = write_projections(self.store, as_of=AS_OF)
+        story_json = json.loads(paths["stories"].read_text(encoding="utf-8"))
+        self.assertEqual(story_json, stories)
+        story_md = (paths["briefs"] / "build-stories.md").read_text(encoding="utf-8")
+        self.assertIn("Changed dimensions**: TRANSPORT", story_md)
+        self.assertIn("Continuity · sameSemanticDesign**: True", story_md)
+        self.assertIn("72,492 bytes", story_md)
+        self.assertIn(digest, story_md)
+
+        page = paths["html"].read_text(encoding="utf-8")
+        self.assertIn("Build Story", page)
+        self.assertIn("Attempts", page)
+        self.assertIn("const dl=el('dl','fields')", page)
+        self.assertIn("Failure domain", page)
+        self.assertIn("Created by attempt", page)
+        self.assertNotIn("['status','supportState','freshness','currentState'", page)
 
     def test_event_registry_schema_matches_runtime_capabilities(self):
         from squawk_box.model import KIND_REPORTERS
