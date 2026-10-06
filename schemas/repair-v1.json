@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://es-3581100.github.io/squawk-box/schema/repair-v1.json",
+  "title": "Squawk Box exceptional replay repair overlay v1",
+  "type": "object",
+  "required": ["schemaVersion", "repairId", "action", "reason", "authorizedBy", "authorizedAt"],
+  "properties": {
+    "schemaVersion": {"const": "donsquad-ledger/repair-v1"},
+    "repairId": {"type": "string", "pattern": "^rpr_[0-9a-f]{32}$"},
+    "action": {"enum": ["QUARANTINE", "REVOKE_QUARANTINE"]},
+    "cursor": {
+      "type": "object", "required": ["segment", "line"],
+      "properties": {"segment": {"type": "integer", "minimum": 1}, "line": {"type": "integer", "minimum": 1}}
+    },
+    "eventId": {"type": "string"},
+    "targetRepairId": {"type": "string"},
+    "reason": {"type": "string", "minLength": 1},
+    "authorizedBy": {
+      "type": "object", "required": ["type", "ref"],
+      "properties": {"type": {"const": "human"}, "ref": {"type": "string", "minLength": 1}}
+    },
+    "authorizedAt": {"type": "string", "format": "date-time"}
+  }
+}
