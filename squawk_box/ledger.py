@@ -820,4 +820,342 @@ class Reducer:
 
         elif kind == "artifact.version_observed":
             assert subject["type"] == "artifactVersion" and validate_id(sid, "artifactVersion"), "invalid artifactVersion subject"
-  
+            assert sid not in self.artifact_versions, "artifact version exists"
+            artifact_id = payload["artifactId"]
+            assert artifact_id in self.artifacts, "artifact not found"
+            size = payload["size"]
+            assert type(size) is int and size >= 0, "artifact size must be nonnegative integer"
+            digest = payload["byteDigest"]
+            assert isinstance(digest, dict), "byteDigest must be object"
+            assert digest.get("algorithm") == "sha256", "artifact byte digest must use sha256"
+            assert digest.get("digestType") in {"artifact_bytes", "source_bytes"}, "unsupported artifact digest type"
+            assert isinstance(digest.get("value"), str) and re.fullmatch(r"[0-9a-f]{64}", digest["value"]), "invalid artifact sha256"
+            persistence = payload.get("persistenceClass", "DURABLE")
+            assert persistence in {"DURABLE", "TEMPORARY", "EPHEMERAL_CAPTURED", "EPHEMERAL_UNCAPTURED"}, "invalid persistenceClass"
+            version = {
+                **base,
+                **deepcopy(payload),
+                "artifactId": artifact_id,
+                "size": size,
+                "byteDigest": deepcopy(digest),
+                "persistenceClass": persistence,
+            }
+            self.artifact_versions[sid] = version
+            artifact = self.artifacts[artifact_id]
+            artifact["versionIds"].append(sid)
+            artifact["currentVersionId"] = sid
+            artifact["currentPath"] = payload.get("pathAtObservation", artifact.get("currentPath"))
+            artifact["lastEventId"] = event["eventId"]
+            artifact["lastCursor"] = cursor.to_dict()
+
+        elif kind == "artifact.presence_observed":
+            assert subject["type"] == "artifact" and sid in self.artifacts, "artifact not found"
+            state = payload["state"]
+            assert state in {"PRESENT", "ABSENT", "DELETED"}, "invalid artifact presence state"
+            observation = {**base, **deepcopy(payload), "state": state}
+            self.artifact_presence[sid] = observation
+            self.artifacts[sid]["presence"] = state
+            self.artifacts[sid]["lastEventId"] = event["eventId"]
+            self.artifacts[sid]["lastCursor"] = cursor.to_dict()
+
+        elif kind == "failure.recorded":
+            assert subject["type"] == "failure" and validate_id(sid, "failure"), "invalid failure subject"
+            assert sid not in self.failures, "failure exists"
+            status = payload.get("status", "OPEN")
+            assert status in FAILURE_STATES, "invalid failure status"
+            self.failures[sid] = {
+                **base,
+                **deepcopy(payload),
+                "status": status,
+                "reportedBy": deepcopy(event["reportedBy"]),
+            }
+
+        elif kind == "failure.status_changed":
+            assert sid in self.failures and subject["type"] == "failure", "failure not found"
+            status = payload["status"]
+            assert status in FAILURE_STATES, "invalid failure status"
+            self.failures[sid].update({
+                "status": status,
+                "resolution": payload.get("resolution"),
+                "lastEventId": event["eventId"],
+                "lastCursor": cursor.to_dict(),
+            })
+
+        elif kind == "authority.observed":
+            assert subject["type"] == "authorityObservation" and validate_id(sid, "authorityObservation"), "invalid authority subject"
+            assert sid not in self.authorities, "authority observation exists"
+            source = payload["source"]
+            observed_state = payload["state"]
+            assert source in AUTHORITY_SOURCES, "invalid authority source"
+            assert observed_state in AUTHORITY_STATES, "invalid authority state"
+            if payload.get("expiresAt") is not None:
+                _parse_time(payload["expiresAt"])
+            self.authorities[sid] = {
+                **base,
+                **deepcopy(payload),
+                "source": source,
+                "observedState": observed_state,
+                "currentState": observed_state,
+                "observedBy": deepcopy(event["reportedBy"]),
+            }
+
+        elif kind == "checkpoint.recorded":
+            assert subject["type"] == "checkpoint" and validate_id(sid, "checkpoint"), "invalid checkpoint subject"
+            assert sid not in self.checkpoints, "checkpoint exists"
+            self.checkpoints[sid] = {
+                **base,
+                **deepcopy(payload),
+                "recordedAt": event["recordedAt"],
+            }
+
+        elif kind == "payload.purged":
+            assert subject["type"] == "payload", "payload purge must target payload"
+            self.payload_purges.append({
+                **base,
+                "subject": deepcopy(subject),
+                "payload": deepcopy(payload),
+                "reportedBy": deepcopy(event["reportedBy"]),
+            })
+
+        elif kind == "event.correction_recorded":
+            assert subject["type"] == "event", "correction must target event"
+            target = payload["targetEventId"]
+            replacement = payload["replacement"]
+            assert isinstance(target, str) and target, "targetEventId required"
+            assert isinstance(replacement, dict), "replacement must be object"
+            self.corrections.append({
+                **base,
+                "targetEventId": target,
+                "replacement": deepcopy(replacement),
+                "reportedBy": deepcopy(event["reportedBy"]),
+            })
+
+        elif kind == "submission.rejected":
+            # Rejected intake is historical evidence only; it cannot create submitted state.
+            self.evidence[f"{event['eventId']}#submission-rejected"] = {
+                **base,
+                "kind": kind,
+                "reportedBy": deepcopy(event["reportedBy"]),
+                "payload": deepcopy(payload),
+            }
+
+        else:
+            raise ValueError(f"unhandled event kind: {kind}")
+
+        for index, relation in enumerate(event.get("relations", []), 1):
+            self._add_relation(event, cursor, relation, index)
+
+    def _add_relation(self, event: dict[str, Any], cursor: Cursor, relation: dict[str, Any], index: int) -> None:
+        source = deepcopy(event["subject"])
+        target = deepcopy(relation["target"])
+        rel = relation["rel"]
+        assert isinstance(rel, str) and rel, "relation name required"
+        assert isinstance(target, dict) and isinstance(target.get("id"), str) and target["id"], "relation target invalid"
+        edge = {
+            "id": f"{event['eventId']}#rel-{index}",
+            "rel": rel,
+            "source": source,
+            "target": target,
+            "eventId": event["eventId"],
+            "cursor": cursor.to_dict(),
+        }
+        self.edges.append(edge)
+        self.outgoing.setdefault(source["id"], []).append(deepcopy(edge))
+        self.incoming.setdefault(target["id"], []).append(deepcopy(edge))
+
+    def _refresh_claim_freshness(self) -> None:
+        # ArtifactVersion bindings are exact-byte bindings. If the logical artifact
+        # has moved to another version, claims tied to the old version become stale.
+        for claim in self.claims.values():
+            if claim.get("supportState") == "RETRACTED":
+                continue
+            for binding in claim.get("evidenceBindings", []):
+                version = self.artifact_versions.get(binding)
+                if not version:
+                    continue
+                artifact = self.artifacts.get(version.get("artifactId"))
+                if artifact and artifact.get("currentVersionId") != binding:
+                    claim["freshness"] = "STALE"
+                    break
+
+        # A stale supporting claim makes directly dependent claims stale. Iterate
+        # to a fixed point; cycles are surfaced as reducer anomalies separately.
+        changed = True
+        while changed:
+            changed = False
+            for claim in list(self.claims.values()):
+                if claim.get("freshness") != "STALE":
+                    continue
+                for target_id in claim.get("supportsClaims", []):
+                    target = self.claims.get(target_id)
+                    if target and target.get("freshness") != "STALE":
+                        target["freshness"] = "STALE"
+                        changed = True
+
+    def _refresh_decision_support(self) -> None:
+        for decision in self.decisions.values():
+            refs = decision.get("evidenceBindings", [])
+            for binding in refs:
+                version = self.artifact_versions.get(binding)
+                if not version:
+                    continue
+                artifact = self.artifacts.get(version.get("artifactId"))
+                if artifact and artifact.get("currentVersionId") != binding:
+                    decision["supportingEvidenceChanged"] = True
+                    break
+
+    def _refresh_authority(self) -> None:
+        for observation in self.authorities.values():
+            current = observation.get("observedState", observation.get("state", "UNKNOWN"))
+            expires = observation.get("expiresAt")
+            if current == "AUTHORIZED" and expires is not None and _parse_time(expires) <= self.as_of_dt:
+                current = "EXPIRED"
+            observation["currentState"] = current
+
+    def _detect_claim_support_cycles(self) -> None:
+        graph = {cid: [x for x in claim.get("supportsClaims", []) if x in self.claims] for cid, claim in self.claims.items()}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node: str, trail: list[str]) -> None:
+            if node in visiting:
+                cycle = trail[trail.index(node):] + [node] if node in trail else trail + [node]
+                marker = {"type": "CLAIM_SUPPORT_CYCLE", "claims": cycle}
+                if marker not in self.anomalies:
+                    self.anomalies.append(marker)
+                return
+            if node in visited:
+                return
+            visiting.add(node)
+            for nxt in graph.get(node, []):
+                visit(nxt, trail + [node])
+            visiting.remove(node)
+            visited.add(node)
+
+        for claim_id in graph:
+            visit(claim_id, [])
+
+    def finalize(self, last_cursor: Cursor | None) -> dict[str, Any]:
+        self._refresh_claim_freshness()
+        self._refresh_decision_support()
+        self._refresh_authority()
+        self._detect_claim_support_cycles()
+
+        active_task_states = {"READY", "ACTIVE", "BLOCKED", "NEEDS_RETRY"}
+        active_tasks = sorted(tid for tid, task in self.tasks.items() if task.get("status") in active_task_states)
+        unresolved_failures = sorted(fid for fid, failure in self.failures.items() if failure.get("status") in {"OPEN", "UNDER_INVESTIGATION"})
+        stale_claims = sorted(cid for cid, claim in self.claims.items() if claim.get("freshness") == "STALE")
+        authority_blockers = sorted(
+            aid for aid, observation in self.authorities.items()
+            if observation.get("currentState") != "AUTHORIZED"
+        )
+        latest_checkpoint = None
+        if self.checkpoints:
+            latest_checkpoint = max(
+                self.checkpoints.values(),
+                key=lambda cp: (cp.get("lastCursor", {}).get("segment", 0), cp.get("lastCursor", {}).get("line", 0)),
+            )["id"]
+
+        entities = {
+            "tasks": deepcopy(self.tasks),
+            "attempts": deepcopy(self.attempts),
+            "agentRuns": deepcopy(self.agent_runs),
+            "suppliedContexts": deepcopy(self.contexts),
+            "decisions": deepcopy(self.decisions),
+            "claims": deepcopy(self.claims),
+            "evidenceBundles": deepcopy(self.evidence),
+            "artifacts": deepcopy(self.artifacts),
+            "artifactVersions": deepcopy(self.artifact_versions),
+            "failures": deepcopy(self.failures),
+            "authorityObservations": deepcopy(self.authorities),
+            "checkpoints": deepcopy(self.checkpoints),
+        }
+        return {
+            "schemaVersion": "donsquad-ledger/state-v1",
+            "reducerVersion": REDUCER_VERSION,
+            "asOf": self.as_of,
+            "sourceCursor": last_cursor.to_dict() if last_cursor else None,
+            "entities": entities,
+            "records": {
+                "handoffs": deepcopy(self.handoffs),
+                "completionProposals": deepcopy(self.completion_proposals),
+                "artifactPresence": deepcopy(self.artifact_presence),
+                "payloadPurges": deepcopy(self.payload_purges),
+                "corrections": deepcopy(self.corrections),
+            },
+            "graph": {
+                "edges": deepcopy(self.edges),
+                "outgoing": deepcopy(self.outgoing),
+                "incoming": deepcopy(self.incoming),
+            },
+            "summary": {
+                "activeTasks": active_tasks,
+                "unresolvedFailures": unresolved_failures,
+                "staleClaims": stale_claims,
+                "authorityBlockers": authority_blockers,
+                "latestCheckpoint": latest_checkpoint,
+            },
+            "indeterminateSubjects": deepcopy(self.indeterminate_subjects),
+            "anomalies": deepcopy(self.anomalies),
+            "warnings": deepcopy(self.warnings),
+        }
+
+
+def _effective_quarantines(repairs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    active: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    for index, repair in enumerate(repairs, 1):
+        repair_id = repair.get("repairId")
+        if not isinstance(repair_id, str) or not validate_id(repair_id, "repair"):
+            raise ReplayBlocked(f"invalid repairId at repairs line {index}")
+        if repair_id in seen:
+            raise ReplayBlocked(f"duplicate repairId {repair_id}")
+        seen.add(repair_id)
+        action = repair.get("action")
+        if action == "QUARANTINE":
+            if repair.get("cursor") is None and not repair.get("eventId"):
+                raise ReplayBlocked(f"quarantine {repair_id} has no target")
+            active[repair_id] = repair
+        elif action == "REVOKE_QUARANTINE":
+            target = repair.get("targetRepairId")
+            if target not in active:
+                raise ReplayBlocked(f"revoke {repair_id} targets unknown/inactive quarantine")
+            del active[target]
+        else:
+            raise ReplayBlocked(f"unsupported repair action at repairs line {index}")
+    return active
+
+
+def _is_quarantined(event: dict[str, Any] | None, cursor: Cursor, quarantines: dict[str, dict[str, Any]]) -> bool:
+    for repair in quarantines.values():
+        repair_cursor = repair.get("cursor")
+        if isinstance(repair_cursor, dict):
+            if repair_cursor.get("segment") == cursor.segment and repair_cursor.get("line") == cursor.line:
+                return True
+        event_id = repair.get("eventId")
+        if event is not None and isinstance(event_id, str) and event.get("eventId") == event_id:
+            return True
+    return False
+
+
+def _apply_correction(original: dict[str, Any], replacement: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"kind", "kindVersion", "occurredAt", "subject", "context", "evidenceRefs", "authorityRefs", "relations", "payload"}
+    unknown = set(replacement) - allowed
+    if unknown:
+        raise ReplayBlocked(f"correction replacement contains manager-owned/unknown fields: {sorted(unknown)}")
+    required = {"kind", "kindVersion", "subject", "payload"}
+    if not required <= set(replacement):
+        raise ReplayBlocked("correction replacement missing required state fields")
+    effective = deepcopy(original)
+    for key in allowed:
+        if key in replacement:
+            effective[key] = deepcopy(replacement[key])
+        elif key in {"context", "evidenceRefs", "authorityRefs", "relations"}:
+            effective[key] = {} if key == "context" else []
+    # Identity and provenance remain those of the original canonical event.
+    effective["eventId"] = original["eventId"]
+    effective["schemaVersion"] = original["schemaVersion"]
+    effective["recordedAt"] = original["recordedAt"]
+    effective["reportedBy"] = deepcopy(original["reportedBy"])
+    effective["submission"] = deepcopy(original["submission"])
+    return effective
