@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "donsquad-ledger/event-kind-registry-v1",
+  "principle": "Existing kind@version semantics are permanent; new kinds or versions are additive.",
+  "kinds": {
+    "submission.rejected@1": ["manager"],
+    "task.created@1": ["human", "donsquad"],
+    "task.completion_proposed@1": ["agentRun"],
+    "task.status_changed@1": ["human", "donsquad"],
+    "attempt.started@1": ["manager"],
+    "attempt.completed@1": ["manager", "agentRun"],
+    "agent_run.started@1": ["manager"],
+    "agent_run.completed@1": ["manager"],
+    "context.supplied@1": ["manager"],
+    "handoff.recorded@1": ["human", "donsquad"],
+    "decision.proposed@1": ["agentRun", "human", "donsquad"],
+    "decision.resolved@1": ["human", "donsquad"],
+    "claim.asserted@1": ["agentRun", "human", "donsquad", "manager", "tool"],
+    "claim.assessed@1": ["manager"],
+    "claim.retracted@1": ["agentRun", "human", "donsquad"],
+    "evidence.recorded@1": ["manager", "human", "donsquad", "agentRun", "tool"],
+    "artifact.registered@1": ["manager"],
+    "artifact.version_observed@1": ["manager"],
+    "artifact.presence_observed@1": ["manager"],
+    "failure.recorded@1": ["manager", "human", "donsquad", "agentRun", "tool"],
+    "failure.status_changed@1": ["manager", "human", "donsquad"],
+    "authority.observed@1": ["manager"],
+    "checkpoint.recorded@1": ["manager"],
+    "payload.purged@1": ["manager"],
+    "event.correction_recorded@1": ["manager"]
+  }
+}
